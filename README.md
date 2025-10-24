@@ -374,6 +374,6 @@ A: 确保客户端正确解析SSE格式，每个事件以 `data: ` 开头，以 
 
 MIT License
 
-## 🔗 相关链接
+## ⚠️ 免责声明
 
-- [Factory AI](https://app.factory.ai
+本项目仅供学习和研究使用，请遵守相关服务的使用条款。
