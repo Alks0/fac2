@@ -1,0 +1,24 @@
+{
+  "name": "factory-ai-proxy",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible proxy for Factory AI and Claude APIs",
+  "main": "dist/main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx --watch main.ts",
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "start:dev": "tsx main.ts"
+  },
+  "dependencies": {
+    "@types/node": "^20.10.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3",
+    "tsx": "^4.6.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

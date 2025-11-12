@@ -65,3 +65,5 @@ deno.lock
 *.zip
 *.tar.gz
 *.rar
+*.ps1
+*.local.json

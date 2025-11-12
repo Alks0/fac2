@@ -1,9 +1,16 @@
 // main.ts
 
-import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
-import { load as loadEnv } from "https://deno.land/std@0.208.0/dotenv/mod.ts";
+import { createServer, IncomingMessage, ServerResponse } from 'http';
+import { config as loadEnv } from 'dotenv';
 
-await loadEnv({ export: true });
+// Load environment variables
+loadEnv();
+
+// Node.js globals are available without import
+// Adding type declarations for TypeScript
+declare const process: {
+  env: Record<string, string | undefined>;
+};
 
 
 /* ====== 类型定义 ====== */
@@ -100,7 +107,11 @@ type SystemTextBlock = { type: "text"; text: string };
 function buildSystemBlocks(additional: string[]): SystemTextBlock[] {
   const basePrompts = [COMPLIANCE_SYSTEM_PROMPT, BUFFER_SYSTEM_PROMPT];
   const baseBlocks = basePrompts.map((text): SystemTextBlock => ({ type: "text", text }));
-  const additionalBlocks = additional.map((text): SystemTextBlock => ({ type: "text", text }));
+  // 将所有额外的系统提示词转换为小写
+  const additionalBlocks = additional.map((text): SystemTextBlock => ({
+    type: "text",
+    text: text.toLowerCase()
+  }));
   return [...baseBlocks, ...additionalBlocks];
 }
 
@@ -112,11 +123,10 @@ function parseEnvList(value?: string | null): string[] {
     .filter(item => item.length > 0);
 }
 
-const FACTORY_API_KEYS = parseEnvList(Deno.env.get("FACTORY_API_KEYS"));
-const PROXY_ACCESS_KEYS = parseEnvList(Deno.env.get("PROXY_ACCESS_KEYS"));
+const FACTORY_API_KEYS = parseEnvList(process.env.FACTORY_API_KEYS);
+const PROXY_ACCESS_KEYS = parseEnvList(process.env.PROXY_ACCESS_KEYS);
 const PROXY_ACCESS_KEY_SET = new Set(PROXY_ACCESS_KEYS);
-const PROXY_KEY_HEADER = Deno.env.get("PROXY_KEY_HEADER") ?? "X-Proxy-Key";
-const PROXY_KEY_HEADER_LOWER = PROXY_KEY_HEADER.toLowerCase();
+const PROXY_KEY_HEADER = process.env.PROXY_KEY_HEADER ?? "X-Proxy-Key";
 
 const CORS_ALLOW_HEADERS = PROXY_ACCESS_KEY_SET.size > 0
   ? `Content-Type, Authorization, ${PROXY_KEY_HEADER}`
@@ -512,7 +522,21 @@ interface ClaudeTextBlock { type: "text"; text: string }
 
 interface ClaudeImageBlock { type: "image"; source: { type: "base64"; media_type: string; data: string } }
 
-type ClaudeContentBlock = ClaudeTextBlock | ClaudeImageBlock;
+interface ClaudeToolUseBlock {
+  type: "tool_use";
+  id: string;
+  name: string;
+  input: any;
+}
+
+interface ClaudeToolResultBlock {
+  type: "tool_result";
+  tool_use_id: string;
+  content: string;
+  is_error?: boolean;
+}
+
+type ClaudeContentBlock = ClaudeTextBlock | ClaudeImageBlock | ClaudeToolUseBlock | ClaudeToolResultBlock;
 
 
 
@@ -532,6 +556,16 @@ interface ClaudeThinking {
 
 }
 
+interface ClaudeTool {
+  name: string;
+  description: string;
+  input_schema: {
+    type: "object";
+    properties: Record<string, any>;
+    required?: string[];
+  };
+}
+
 interface ClaudeRequest {
 
   model: string;
@@ -549,6 +583,8 @@ interface ClaudeRequest {
   top_p?: number;
 
   thinking?: ClaudeThinking;
+
+  tools?: ClaudeTool[];
 
 }
 
@@ -854,6 +890,47 @@ function normalizeClaudeModel(model: string): string {
 
 
 
+/* ====== OpenAI/Claude Tools 转换 ====== */
+
+function convertToolsToClaude(tools: any[]): ClaudeTool[] {
+  const claudeTools: ClaudeTool[] = [];
+
+  for (const tool of tools) {
+    // 检查是否已经是 Claude 格式（有 input_schema）
+    if (tool.input_schema) {
+      claudeTools.push({
+        name: tool.name,
+        description: tool.description || "",
+        input_schema: tool.input_schema
+      });
+    }
+    // 支持 OpenAI 标准格式
+    else if (tool.type === "function" && tool.function) {
+      claudeTools.push({
+        name: tool.function.name,
+        description: tool.function.description || "",
+        input_schema: tool.function.parameters || {
+          type: "object",
+          properties: {},
+        }
+      });
+    }
+    // 支持简化格式（有 name 但没有 input_schema）
+    else if (tool.name && !tool.input_schema) {
+      claudeTools.push({
+        name: tool.name,
+        description: tool.description || "",
+        input_schema: tool.parameters || {
+          type: "object",
+          properties: {},
+        }
+      });
+    }
+  }
+
+  return claudeTools;
+}
+
 /* ====== OpenAI -> Claude 转换 ====== */
 
 function toClaudeRequest(openaiReq: OpenAIRequest): ClaudeRequest {
@@ -998,6 +1075,9 @@ function toClaudeRequest(openaiReq: OpenAIRequest): ClaudeRequest {
 
     ...(thinking ? { thinking } : {}),
 
+    // 如果前端传入了 tools，转换格式并传递
+    ...(openaiReq.tools ? { tools: convertToolsToClaude(openaiReq.tools) } : {}),
+
   };
 
 }
@@ -1017,8 +1097,6 @@ function toFactoryAIRequest(openaiReq: OpenAIRequest, forceStream: boolean): Fac
     stream,
 
     max_tokens,
-
-    temperature,
 
     top_p,
 
@@ -1372,7 +1450,7 @@ async function pipeClaudeStreamToClient(claudeResp: Response, model: string): Pr
 
     try {
 
-      await parseSSEStream(claudeResp, async ({ event, data }) => {
+      await parseSSEStream(claudeResp, async ({ data }) => {
 
         if (!data) return;
 
@@ -1631,7 +1709,7 @@ async function collectFromUpstreamSSE(factoryResp: Response, model: string) {
 
 
 
-  await parseSSEStream(factoryResp, ({ event, data }) => {
+  await parseSSEStream(factoryResp, ({ data }) => {
 
     if (!data) return;
 
@@ -1819,7 +1897,7 @@ async function pipeStreamToClient(factoryResp: Response, model: string): Promise
 
     try {
 
-      await parseSSEStream(factoryResp, async ({ event, data }) => {
+      await parseSSEStream(factoryResp, async ({ data }) => {
 
         if (!data) return;
 
@@ -1997,48 +2075,130 @@ async function pipeStreamToClient(factoryResp: Response, model: string): Promise
 
 
 
-/* ====== HTTP处理 ====== */
+/* ====== Claude 原生格式处理 ====== */
 
-async function handleRequest(req: Request): Promise<Response> {
+async function handleClaudeNativeRequest(req: Request): Promise<Response> {
+  try {
+    const authHeaderRaw = req.headers.get("Authorization");
+    const authToken = extractAuthToken(authHeaderRaw);
+    const proxyHeaderToken = (req.headers.get(PROXY_KEY_HEADER) ?? "").trim();
 
-  // CORS 预检
+    let matchedProxyKey: string | null = null;
+    if (proxyHeaderToken) {
+      if (PROXY_ACCESS_KEY_SET.has(proxyHeaderToken)) {
+        matchedProxyKey = proxyHeaderToken;
+      } else {
+        return createErrorResponse("Missing or invalid proxy access key", 401, "invalid_proxy_key", "proxy_key");
+      }
+    }
 
-  if (req.method === "OPTIONS") {
+    if (!matchedProxyKey && authToken && PROXY_ACCESS_KEY_SET.has(authToken)) {
+      matchedProxyKey = authToken;
+    }
 
-    return new Response(null, {
+    if (PROXY_ACCESS_KEY_SET.size > 0 && !matchedProxyKey && !authToken) {
+      return createErrorResponse("Missing or invalid proxy access key", 401, "invalid_proxy_key", "proxy_key");
+    }
 
-      status: 200,
+    const authTokenIsProxyKey = Boolean(matchedProxyKey) && authToken === matchedProxyKey;
 
+    let apiKey = "";
+    if (!authTokenIsProxyKey && authToken) {
+      apiKey = authToken;
+    }
+
+    if (!apiKey) {
+      apiKey = getNextFactoryApiKey() ?? "";
+      if (apiKey) {
+        console.log("使用Factory密钥:", maskKeyForLog(apiKey));
+      }
+    }
+
+    if (!apiKey) {
+      return createErrorResponse("Missing or invalid Authorization header", 401, "invalid_request_error", "invalid_api_key");
+    }
+
+    // 解析Claude原生请求
+    const claudeReq = await req.json() as ClaudeRequest;
+
+    // 处理系统提示词注入
+    let systemField = claudeReq.system;
+    let systemBlocks: SystemTextBlock[] = [];
+
+    if (systemField) {
+      if (typeof systemField === "string") {
+        // 如果是字符串，转换为块数组并添加合规提示词
+        systemBlocks = buildSystemBlocks([systemField]);
+      } else if (Array.isArray(systemField)) {
+        // 如果已经是块数组，提取文本并重建
+        const existingTexts = systemField
+          .filter(block => block.type === "text")
+          .map(block => block.text);
+        systemBlocks = buildSystemBlocks(existingTexts);
+      }
+    } else {
+      // 如果没有系统提示词，只添加合规提示词
+      systemBlocks = buildSystemBlocks([]);
+    }
+
+    // 构建最终的Claude请求
+    const finalClaudeReq = {
+      ...claudeReq,
+      system: systemBlocks
+    };
+
+    console.log("正在发送Claude API请求 (原生格式)...");
+    console.log("URL: https://app.factory.ai/api/llm/a/v1/messages");
+    console.log("模型:", finalClaudeReq.model);
+    console.log("流式:", finalClaudeReq.stream);
+    console.log("最大tokens:", finalClaudeReq.max_tokens);
+    console.log("对话轮数:", finalClaudeReq.messages.length);
+    console.log("系统提示词数量:", systemBlocks.length);
+    console.log("系统提示词内容:");
+    systemBlocks.forEach((block, index) => {
+      console.log(`  [${index}]: ${block.text.substring(0, 50)}...`);
+    });
+    console.log("-".repeat(50));
+
+    const claudeResp = await fetch("https://app.factory.ai/api/llm/a/v1/messages", {
+      method: "POST",
       headers: {
-
-        "Access-Control-Allow-Origin": "*",
-
-        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-
-        "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
-
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+        "anthropic-beta": "context-1m-2025-08-07",
+        "anthropic-version": "2023-06-01",
       },
-
+      body: JSON.stringify(finalClaudeReq),
     });
 
+    if (!claudeResp.ok) {
+      return await createErrorResponseFromUpstream(claudeResp, "Claude");
+    }
+
+    // 直接返回Claude响应，添加CORS头
+    const responseHeaders = new Headers(claudeResp.headers);
+    responseHeaders.set("Access-Control-Allow-Origin", "*");
+    responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    responseHeaders.set("Access-Control-Allow-Headers", CORS_ALLOW_HEADERS);
+
+    return new Response(claudeResp.body, {
+      status: claudeResp.status,
+      headers: responseHeaders,
+    });
+
+  } catch (error: any) {
+    console.error("处理Claude原生请求时发生错误:", error);
+    return createErrorResponse(
+      `Internal Server Error: ${error?.message || String(error)}`,
+      500,
+      "internal_error"
+    );
   }
+}
 
+/* ====== OpenAI兼容格式处理 ====== */
 
-
-  if (req.method !== "POST") {
-
-    return createErrorResponse("Method not allowed", 405, "invalid_request_error");
-
-  }
-
-
-
-  const url = new URL(req.url);
-
-  if (!url.pathname.includes("/v1/chat/completions")) {
-    return createErrorResponse("Not found", 404, "invalid_request_error");
-  }
-
+async function handleOpenAIRequest(req: Request): Promise<Response> {
   try {
     const authHeaderRaw = req.headers.get("Authorization");
     const authToken = extractAuthToken(authHeaderRaw);
@@ -2213,36 +2373,25 @@ async function handleRequest(req: Request): Promise<Response> {
     // Claude模型处理
 
     if (isClaude) {
-
+      // 标准模式：进行格式转换
       const claudeReq = toClaudeRequest(openaiReq);
 
-
-
       console.log("正在发送Claude API请求...");
-
       console.log("URL: https://app.factory.ai/api/llm/a/v1/messages");
-
       console.log("原始模型:", openaiReq.model);
-
       console.log("实际模型:", claudeReq.model);
-
       console.log("思考模式:", hasThinking ? "已启用 (16k tokens)" : "未启用");
-
       console.log("流式:", claudeReq.stream);
-
       console.log("最大tokens:", claudeReq.max_tokens);
-
       console.log("对话轮数:", claudeReq.messages.length);
-
-      if (hasThinking) {
-
-        console.log("Thinking配置:", JSON.stringify(claudeReq.thinking));
-
+      if (claudeReq.tools && claudeReq.tools.length > 0) {
+        console.log("工具数量:", claudeReq.tools.length);
+        console.log("工具列表:", claudeReq.tools.map(t => t.name).join(", "));
       }
-
+      if (hasThinking) {
+        console.log("Thinking配置:", JSON.stringify(claudeReq.thinking));
+      }
       console.log("-".repeat(50));
-
-
 
       const claudeResp = await fetch("https://app.factory.ai/api/llm/a/v1/messages", {
 
@@ -2400,19 +2549,139 @@ async function handleRequest(req: Request): Promise<Response> {
 
 }
 
+/* ====== HTTP路由处理 ====== */
 
+async function handleRequest(req: Request): Promise<Response> {
+  // CORS 预检
+  if (req.method === "OPTIONS") {
+    return new Response(null, {
+      status: 200,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
+      },
+    });
+  }
+
+  if (req.method !== "POST") {
+    return createErrorResponse("Method not allowed", 405, "invalid_request_error");
+  }
+
+  const url = new URL(req.url);
+
+  // 路由到不同的处理函数
+  if (url.pathname.includes("/v1/messages")) {
+    // Claude 原生格式端点
+    return handleClaudeNativeRequest(req);
+  } else if (url.pathname.includes("/v1/chat/completions")) {
+    // OpenAI 兼容格式端点
+    return handleOpenAIRequest(req);
+  } else {
+    return createErrorResponse("Not found", 404, "invalid_request_error");
+  }
+}
+
+
+
+/* ====== Node.js HTTP 服务器适配器 ====== */
+
+async function nodeRequestToFetchRequest(req: IncomingMessage, body: Buffer): Promise<Request> {
+  const protocol = (req.socket as any).encrypted ? 'https' : 'http';
+  const host = req.headers.host || 'localhost';
+  const url = new URL(req.url || '/', `${protocol}://${host}`);
+
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (value) {
+      if (Array.isArray(value)) {
+        value.forEach(v => headers.append(key, v));
+      } else {
+        headers.set(key, value);
+      }
+    }
+  }
+
+  return new Request(url.toString(), {
+    method: req.method || 'GET',
+    headers,
+    body: req.method !== 'GET' && req.method !== 'HEAD' ? new Uint8Array(body) : undefined,
+  });
+}
+
+async function fetchResponseToNodeResponse(fetchResponse: Response, res: ServerResponse): Promise<void> {
+  res.statusCode = fetchResponse.status;
+
+  // Set headers
+  fetchResponse.headers.forEach((value, key) => {
+    res.setHeader(key, value);
+  });
+
+  // Stream body
+  if (fetchResponse.body) {
+    const reader = fetchResponse.body.getReader();
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  res.end();
+}
 
 /* ====== 启动 ====== */
 
-serve(handleRequest, { port: 8001 });
+const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  try {
+    // Collect request body
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    const body = Buffer.concat(chunks);
 
-console.log("OpenAI反向代理服务器已启动，监听端口 8001");
+    // Convert to Fetch API Request
+    const fetchRequest = await nodeRequestToFetchRequest(req, body);
 
-console.log("端点: http://localhost:8001/v1/chat/completions");
+    // Process request
+    const fetchResponse = await handleRequest(fetchRequest);
 
-console.log("支持模型: Factory AI (OpenAI) 和 Claude 系列");
+    // Convert back to Node.js response
+    await fetchResponseToNodeResponse(fetchResponse, res);
 
-console.log("Claude思考模式: 模型名包含 '-thinking' 后缀自动启用");
+  } catch (error) {
+    console.error('Server error:', error);
+    res.statusCode = 500;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({
+      error: {
+        message: 'Internal Server Error',
+        type: 'internal_error',
+        code: null,
+        param: null,
+      }
+    }));
+  }
+});
 
-console.log("  示例: claude-3-5-sonnet-20241022-thinking");
+const PORT = 8001;
+server.listen(PORT, () => {
+  console.log(`反向代理服务器已启动，监听端口 ${PORT}`);
+  console.log(`\n支持的端点:`);
+  console.log(`  - OpenAI格式: http://localhost:${PORT}/v1/chat/completions`);
+  console.log(`  - Claude原生格式: http://localhost:${PORT}/v1/messages`);
+  console.log(`\n支持模型:`);
+  console.log(`  - Factory AI 模型 (通过OpenAI端点)`);
+  console.log(`  - Claude 系列模型 (两个端点都支持)`);
+  console.log(`\nClaude特性:`);
+  console.log(`  - 思考模式: 模型名包含 '-thinking' 后缀自动启用`);
+  console.log(`    示例: claude-3-5-sonnet-20241022-thinking`);
+  console.log(`\n注意: 所有请求都会自动注入合规系统提示词`);
+});
 
