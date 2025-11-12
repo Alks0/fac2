@@ -15,7 +15,6 @@
 
 - **特殊功能**
   - Claude 思考模式：模型名包含 `-thinking` 后缀时自动启用（16k thinking tokens）
-  - 自动合规提示词注入：绕过 Factory AI 的使用限制
   - 1M token context 支持（通过 anthropic-beta header）
   - 流式响应支持
   - 多模态支持（文本和图片）
