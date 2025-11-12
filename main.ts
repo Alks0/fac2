@@ -2121,6 +2121,20 @@ async function handleClaudeNativeRequest(req: Request): Promise<Response> {
     // 解析Claude原生请求
     const claudeReq = await req.json() as ClaudeRequest;
 
+    // 检查是否是需要拒绝的模型
+    if (claudeReq.model === "claude-haiku-4-5-20251001") {
+      console.log("检测到被拒绝的模型: claude-haiku-4-5-20251001, 静默拒绝请求");
+      return new Response(JSON.stringify({ error: {} }), {
+        status: 400,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
+        },
+      });
+    }
+
     // 处理系统提示词注入
     let systemField = claudeReq.system;
     let systemBlocks: SystemTextBlock[] = [];
