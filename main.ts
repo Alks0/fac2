@@ -856,6 +856,26 @@ function stripBedrockPrefix(model: string): string {
 
 
 
+function isVertexModel(model: string): boolean {
+
+  if (typeof model !== "string") return false;
+
+  return model.toLowerCase().includes("vertex");
+
+}
+
+
+
+function stripVertexPrefix(model: string): string {
+
+  if (typeof model !== "string") return "";
+
+  return model.replace(/^vertex[-_:]?/i, "");
+
+}
+
+
+
 function isClaudeModel(model: string): boolean {
 
   if (typeof model !== "string") return false;
@@ -1176,10 +1196,18 @@ function toFactoryAIRequest(openaiReq: OpenAIRequest, forceStream: boolean): Fac
 
 
 
-  const reasoningPayload: Record<string, unknown> =
-    reasoning && typeof reasoning === "object" ? { ...reasoning } : {};
-  if (!("summary" in reasoningPayload)) {
-    reasoningPayload["summary"] = "auto";
+  // 只有当用户明确传入reasoning参数时才添加
+  const hasReasoning = reasoning && typeof reasoning === "object";
+  let reasoningPayload: Record<string, unknown> | undefined;
+
+  if (hasReasoning) {
+    console.log("检测到reasoning参数:", JSON.stringify(reasoning));
+    reasoningPayload = { ...reasoning };
+    if (!("summary" in reasoningPayload)) {
+      reasoningPayload["summary"] = "auto";
+    }
+  } else {
+    console.log("未检测到reasoning参数，不会添加到请求中");
   }
 
   return {
@@ -1193,8 +1221,7 @@ function toFactoryAIRequest(openaiReq: OpenAIRequest, forceStream: boolean): Fac
     top_p: top_p ?? 1.0,
     store: false,
     parallel_tool_calls: true,
-    include: ["reasoning.encrypted_content"],
-    reasoning: reasoningPayload,
+    ...(hasReasoning ? { include: ["reasoning.encrypted_content"], reasoning: reasoningPayload } : {}),
   };
 }
 
@@ -2121,33 +2148,37 @@ async function handleClaudeNativeRequest(req: Request): Promise<Response> {
     // 解析Claude原生请求
     const claudeReq = await req.json() as ClaudeRequest;
 
-    // 检查是否是需要拒绝的模型
-    if (claudeReq.model === "claude-haiku-4-5-20251001") {
-      console.log("检测到被拒绝的模型: claude-haiku-4-5-20251001, 静默拒绝请求");
-      return new Response(JSON.stringify({ error: {} }), {
-        status: 400,
-        headers: {
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
-        },
-      });
-    }
-
     // 处理系统提示词注入
     let systemField = claudeReq.system;
     let systemBlocks: SystemTextBlock[] = [];
 
     if (systemField) {
       if (typeof systemField === "string") {
-        // 如果是字符串，转换为块数组并添加合规提示词
-        systemBlocks = buildSystemBlocks([systemField]);
+        // 如果是字符串，先检查是否是需要过滤的内容
+        const lowerText = systemField.toLowerCase();
+        if (!lowerText.startsWith("you are claude code, anthropic's official cli for") &&
+            !lowerText.startsWith("you are an interactive cli tool that helps users")) {
+          systemBlocks = buildSystemBlocks([systemField]);
+        } else {
+          // 被过滤的内容，只添加合规提示词
+          console.log("过滤掉Claude Code系统提示词:", systemField.substring(0, 50) + "...");
+          systemBlocks = buildSystemBlocks([]);
+        }
       } else if (Array.isArray(systemField)) {
         // 如果已经是块数组，提取文本并重建
         const existingTexts = systemField
           .filter(block => block.type === "text")
-          .map(block => block.text);
+          .map(block => block.text)
+          // 过滤掉特定的Claude Code系统提示词
+          .filter(text => {
+            const lowerText = text.toLowerCase();
+            if (lowerText.startsWith("you are claude code, anthropic's official cli for") ||
+                lowerText.startsWith("you are an interactive cli tool that helps users")) {
+              console.log("过滤掉Claude Code系统提示词:", text.substring(0, 50) + "...");
+              return false;
+            }
+            return true;
+          });
         systemBlocks = buildSystemBlocks(existingTexts);
       }
     } else {
@@ -2179,7 +2210,7 @@ async function handleClaudeNativeRequest(req: Request): Promise<Response> {
       headers: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${apiKey}`,
-        "anthropic-beta": "context-1m-2025-08-07",
+        "anthropic-beta": "interleaved-thinking-2025-05-14,context-1m-2025-08-07",
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify(finalClaudeReq),
@@ -2270,9 +2301,12 @@ async function handleOpenAIRequest(req: Request): Promise<Response> {
 
     const isBedrock = isBedrockModel(openaiReq.model);
 
-    const effectiveModel = isBedrock ? stripBedrockPrefix(openaiReq.model) : openaiReq.model;
+    const isVertex = isVertexModel(openaiReq.model);
 
-    const isClaude = !isBedrock && isClaudeModel(effectiveModel);
+    const effectiveModel = isBedrock ? stripBedrockPrefix(openaiReq.model) :
+                          isVertex ? stripVertexPrefix(openaiReq.model) : openaiReq.model;
+
+    const isClaude = !isBedrock && !isVertex && isClaudeModel(effectiveModel);
 
     const hasThinking = isClaudeThinkingModel(effectiveModel);
 
@@ -2363,6 +2397,112 @@ async function handleOpenAIRequest(req: Request): Promise<Response> {
         const bedrockData = await bedrockResp.json();
 
         return new Response(JSON.stringify(claudeToOpenAINonStream(bedrockData, openaiReq.model)), {
+
+          headers: {
+
+            "Content-Type": "application/json",
+
+            "Access-Control-Allow-Origin": "*",
+
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+
+            "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
+
+          },
+
+        });
+
+      }
+
+    }
+
+
+
+    // Vertex模型处理
+
+    if (isVertex) {
+
+      const vertexOpenAIReq: OpenAIRequest = {
+
+        ...openaiReq,
+
+        model: effectiveModel,
+
+      };
+
+      const vertexReq = toClaudeRequest(vertexOpenAIReq);
+
+
+
+      console.log("正在发送Vertex API请求...");
+
+      console.log("URL: https://app.factory.ai/api/llm/a/v1/messages");
+
+      console.log("原始模型:", openaiReq.model);
+
+      console.log("实际模型:", vertexReq.model);
+
+      console.log("思考模式:", hasThinking ? "已启用 (16k tokens)" : "未启用");
+
+      console.log("流式:", vertexReq.stream);
+
+      console.log("最大tokens:", vertexReq.max_tokens);
+
+      console.log("对话轮数:", vertexReq.messages.length);
+
+      if (hasThinking) {
+
+        console.log("Thinking配置:", JSON.stringify(vertexReq.thinking));
+
+      }
+
+      console.log("模型提供商: vertex");
+
+      console.log("-".repeat(50));
+
+
+
+      const vertexResp = await fetch("https://app.factory.ai/api/llm/a/v1/messages", {
+
+        method: "POST",
+
+        headers: {
+
+          "Content-Type": "application/json",
+
+          "Authorization": `Bearer ${apiKey}`,
+
+          "anthropic-beta": "context-1m-2025-08-07",
+
+          "anthropic-version": "2023-06-01",
+
+          "x-api-provider": "vertex_anthropic",
+
+        },
+
+        body: JSON.stringify(vertexReq),
+
+      });
+
+
+
+      if (!vertexResp.ok) {
+
+        return await createErrorResponseFromUpstream(vertexResp, "Vertex");
+
+      }
+
+
+
+      if (clientWantsStream) {
+
+        return await pipeClaudeStreamToClient(vertexResp, openaiReq.model);
+
+      } else {
+
+        const vertexData = await vertexResp.json();
+
+        return new Response(JSON.stringify(claudeToOpenAINonStream(vertexData, openaiReq.model)), {
 
           headers: {
 
@@ -2693,9 +2833,13 @@ server.listen(PORT, () => {
   console.log(`\n支持模型:`);
   console.log(`  - Factory AI 模型 (通过OpenAI端点)`);
   console.log(`  - Claude 系列模型 (两个端点都支持)`);
+  console.log(`  - Bedrock 模型 (模型名包含 'bedrock' 前缀)`);
+  console.log(`  - Vertex 模型 (模型名包含 'vertex' 前缀)`);
   console.log(`\nClaude特性:`);
   console.log(`  - 思考模式: 模型名包含 '-thinking' 后缀自动启用`);
   console.log(`    示例: claude-3-5-sonnet-20241022-thinking`);
+  console.log(`  - Bedrock示例: bedrock-claude-3-5-sonnet-20241022`);
+  console.log(`  - Vertex示例: vertex-claude-3-5-sonnet-20241022`);
   console.log(`\n注意: 所有请求都会自动注入合规系统提示词`);
 });
 

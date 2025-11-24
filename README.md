@@ -115,6 +115,7 @@ npm start
 **特性**:
 - 直接支持 Claude 原生请求格式
 - 保留所有原始功能（tools、thinking 等）
+- 自动过滤 Claude Code 的特定系统提示词（"You are Claude Code..." 和 "You are an interactive CLI..."）
 
 ## 认证方式
 
@@ -143,6 +144,7 @@ npm start
 1. **安全性**：请妥善保管 API 密钥，不要将包含真实密钥的 `.env` 文件提交到版本控制系统
 2. **合规性**：本项目通过注入特定系统提示词来绕过某些限制，请合理使用
 3. **错误处理**：如遇到 403 错误，可能是系统提示词被检测，请检查日志中的提示词内容
+4. **Claude Code 兼容性**：原生格式端点会自动过滤 Claude Code 的系统提示词，避免与 Factory AI 的限制冲突
 
 ## 技术栈
 
