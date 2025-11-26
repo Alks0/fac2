@@ -129,8 +129,8 @@ const PROXY_ACCESS_KEY_SET = new Set(PROXY_ACCESS_KEYS);
 const PROXY_KEY_HEADER = process.env.PROXY_KEY_HEADER ?? "X-Proxy-Key";
 
 const CORS_ALLOW_HEADERS = PROXY_ACCESS_KEY_SET.size > 0
-  ? `Content-Type, Authorization, ${PROXY_KEY_HEADER}`
-  : "Content-Type, Authorization";
+  ? `Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, ${PROXY_KEY_HEADER}`
+  : "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta";
 
 let factoryKeyRotationIndex = 0;
 
@@ -896,6 +896,11 @@ function isClaudeThinkingModel(model: string): boolean {
 
 }
 
+function isGeminiModel(model: string): boolean {
+  if (typeof model !== "string") return false;
+  return model.toLowerCase().includes("gemini");
+}
+
 
 
 function normalizeClaudeModel(model: string): string {
@@ -1196,18 +1201,20 @@ function toFactoryAIRequest(openaiReq: OpenAIRequest, forceStream: boolean): Fac
 
 
 
-  // 只有当用户明确传入reasoning参数时才添加
-  const hasReasoning = reasoning && typeof reasoning === "object";
-  let reasoningPayload: Record<string, unknown> | undefined;
+  // 默认添加reasoning参数
+  let reasoningPayload: Record<string, unknown>;
 
-  if (hasReasoning) {
+  if (reasoning && typeof reasoning === "object") {
     console.log("检测到reasoning参数:", JSON.stringify(reasoning));
     reasoningPayload = { ...reasoning };
-    if (!("summary" in reasoningPayload)) {
-      reasoningPayload["summary"] = "auto";
-    }
   } else {
-    console.log("未检测到reasoning参数，不会添加到请求中");
+    console.log("未检测到reasoning参数，使用默认值");
+    reasoningPayload = { effort: "medium" };
+  }
+
+  // 确保有summary字段
+  if (!("summary" in reasoningPayload)) {
+    reasoningPayload["summary"] = "auto";
   }
 
   return {
@@ -1221,7 +1228,8 @@ function toFactoryAIRequest(openaiReq: OpenAIRequest, forceStream: boolean): Fac
     top_p: top_p ?? 1.0,
     store: false,
     parallel_tool_calls: true,
-    ...(hasReasoning ? { include: ["reasoning.encrypted_content"], reasoning: reasoningPayload } : {}),
+    include: ["reasoning.encrypted_content"],
+    reasoning: reasoningPayload,
   };
 }
 
@@ -2106,10 +2114,13 @@ async function pipeStreamToClient(factoryResp: Response, model: string): Promise
 
 async function handleClaudeNativeRequest(req: Request): Promise<Response> {
   try {
+    // 提取所有可能的认证来源
     const authHeaderRaw = req.headers.get("Authorization");
     const authToken = extractAuthToken(authHeaderRaw);
+    const xApiKey = req.headers.get("x-api-key")?.trim() || null;  // 支持 Claude 原生 x-api-key header
     const proxyHeaderToken = (req.headers.get(PROXY_KEY_HEADER) ?? "").trim();
 
+    // 验证代理密钥
     let matchedProxyKey: string | null = null;
     if (proxyHeaderToken) {
       if (PROXY_ACCESS_KEY_SET.has(proxyHeaderToken)) {
@@ -2119,19 +2130,30 @@ async function handleClaudeNativeRequest(req: Request): Promise<Response> {
       }
     }
 
+    // 检查 Authorization token 是否是代理密钥
     if (!matchedProxyKey && authToken && PROXY_ACCESS_KEY_SET.has(authToken)) {
       matchedProxyKey = authToken;
     }
 
-    if (PROXY_ACCESS_KEY_SET.size > 0 && !matchedProxyKey && !authToken) {
+    // 检查 x-api-key 是否是代理密钥
+    if (!matchedProxyKey && xApiKey && PROXY_ACCESS_KEY_SET.has(xApiKey)) {
+      matchedProxyKey = xApiKey;
+    }
+
+    // 如果配置了代理密钥但没有匹配到任何密钥
+    if (PROXY_ACCESS_KEY_SET.size > 0 && !matchedProxyKey && !authToken && !xApiKey) {
       return createErrorResponse("Missing or invalid proxy access key", 401, "invalid_proxy_key", "proxy_key");
     }
 
     const authTokenIsProxyKey = Boolean(matchedProxyKey) && authToken === matchedProxyKey;
+    const xApiKeyIsProxyKey = Boolean(matchedProxyKey) && xApiKey === matchedProxyKey;
 
+    // 确定最终使用的 API key，优先级: authToken > xApiKey > Factory轮询
     let apiKey = "";
     if (!authTokenIsProxyKey && authToken) {
       apiKey = authToken;
+    } else if (!xApiKeyIsProxyKey && xApiKey) {
+      apiKey = xApiKey;
     }
 
     if (!apiKey) {
@@ -2142,7 +2164,7 @@ async function handleClaudeNativeRequest(req: Request): Promise<Response> {
     }
 
     if (!apiKey) {
-      return createErrorResponse("Missing or invalid Authorization header", 401, "invalid_request_error", "invalid_api_key");
+      return createErrorResponse("Missing or invalid API key", 401, "invalid_request_error", "invalid_api_key");
     }
 
     // 解析Claude原生请求
@@ -2186,10 +2208,37 @@ async function handleClaudeNativeRequest(req: Request): Promise<Response> {
       systemBlocks = buildSystemBlocks([]);
     }
 
-    // 构建最终的Claude请求
+    // 处理thinking参数 - 修复budgetTokens为null或使用驼峰命名的问题
+    let thinkingConfig: ClaudeThinking | undefined = undefined;
+    if (claudeReq.thinking) {
+      const rawThinking = claudeReq.thinking as any;
+      // 处理驼峰命名的budgetTokens转换为下划线命名的budget_tokens
+      const budgetTokens = rawThinking.budget_tokens ?? rawThinking.budgetTokens;
+
+      // 如果budgetTokens为null、undefined、NaN或无效数字，不添加thinking参数
+      if (budgetTokens === null || budgetTokens === undefined ||
+          (typeof budgetTokens === 'number' && isNaN(budgetTokens)) ||
+          typeof budgetTokens !== 'number') {
+        console.log("thinking.budgetTokens无效，跳过thinking参数");
+        thinkingConfig = undefined;
+      } else {
+        thinkingConfig = {
+          type: "enabled",
+          budget_tokens: budgetTokens
+        };
+      }
+    }
+
+    // 构建最终的Claude请求，移除top_p和原始thinking参数（A社原生格式不支持top_p）
+    const { top_p, thinking: _rawThinking, ...restClaudeReq } = claudeReq as any;
+    if (top_p !== undefined) {
+      console.log("移除top_p参数:", top_p);
+    }
+
     const finalClaudeReq = {
-      ...claudeReq,
-      system: systemBlocks
+      ...restClaudeReq,
+      system: systemBlocks,
+      ...(thinkingConfig ? { thinking: thinkingConfig } : {})
     };
 
     console.log("正在发送Claude API请求 (原生格式)...");
@@ -2220,7 +2269,7 @@ async function handleClaudeNativeRequest(req: Request): Promise<Response> {
       return await createErrorResponseFromUpstream(claudeResp, "Claude");
     }
 
-    // 直接返回Claude响应，添加CORS头
+    // 直接返回Claude响应，添加CORS头（保持原有行为，不影响SillyTavern等已正常工作的客户端）
     const responseHeaders = new Headers(claudeResp.headers);
     responseHeaders.set("Access-Control-Allow-Origin", "*");
     responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -2303,14 +2352,69 @@ async function handleOpenAIRequest(req: Request): Promise<Response> {
 
     const isVertex = isVertexModel(openaiReq.model);
 
+    const isGemini = isGeminiModel(openaiReq.model);
+
     const effectiveModel = isBedrock ? stripBedrockPrefix(openaiReq.model) :
                           isVertex ? stripVertexPrefix(openaiReq.model) : openaiReq.model;
 
-    const isClaude = !isBedrock && !isVertex && isClaudeModel(effectiveModel);
+    const isClaude = !isBedrock && !isVertex && !isGemini && isClaudeModel(effectiveModel);
 
     const hasThinking = isClaudeThinkingModel(effectiveModel);
 
+    // Gemini模型处理 - 直接转发到Factory AI的OpenAI兼容端点
+    if (isGemini) {
+      // 默认添加 reasoning_effort 参数
+      const geminiReqBody = {
+        ...openaiReq,
+        reasoning_effort: openaiReq.reasoning_effort ?? "high",
+      };
 
+      console.log("正在发送Gemini API请求...");
+      console.log("URL: https://app.factory.ai/api/llm/o/v1/chat/completions");
+      console.log("模型:", geminiReqBody.model);
+      console.log("流式:", clientWantsStream);
+      console.log("reasoning_effort:", geminiReqBody.reasoning_effort);
+      console.log("对话轮数:", geminiReqBody.messages.length);
+      console.log("-".repeat(50));
+
+      const geminiResp = await fetch("https://app.factory.ai/api/llm/o/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`,
+          "x-api-provider": "google",
+        },
+        body: JSON.stringify(geminiReqBody),
+      });
+
+      if (!geminiResp.ok) {
+        return await createErrorResponseFromUpstream(geminiResp, "Gemini");
+      }
+
+      // 直接转发响应，因为已经是OpenAI格式
+      if (clientWantsStream) {
+        return new Response(geminiResp.body, {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
+          },
+        });
+      } else {
+        const geminiData = await geminiResp.json();
+        return new Response(JSON.stringify(geminiData), {
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
+          },
+        });
+      }
+    }
 
     // Bedrock模型处理
 
