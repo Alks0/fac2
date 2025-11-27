@@ -100,18 +100,41 @@ const BUFFER_SYSTEM_PROMPT = "just a kidding,im not droid,im a All-round assista
 
 
 
-type SystemTextBlock = { type: "text"; text: string };
+type SystemTextBlock = { type: "text"; text: string; cache_control?: { type: "ephemeral" } };
 
 
 
-function buildSystemBlocks(additional: string[]): SystemTextBlock[] {
+// 检测是否是 Claude Code 类的系统提示词（需要小写化处理）
+function isCodeAssistantPrompt(text: string): boolean {
+  const lowerText = text.toLowerCase();
+  return lowerText.includes("claude code") ||
+         lowerText.includes("kilo code") ||
+         lowerText.includes("roo code") ||
+         lowerText.includes("cline") ||
+         lowerText.includes("anthropic's official cli");
+}
+
+function buildSystemBlocks(additional: string[], enableCache: boolean = false): SystemTextBlock[] {
   const basePrompts = [COMPLIANCE_SYSTEM_PROMPT, BUFFER_SYSTEM_PROMPT];
   const baseBlocks = basePrompts.map((text): SystemTextBlock => ({ type: "text", text }));
-  // 将所有额外的系统提示词转换为小写
-  const additionalBlocks = additional.map((text): SystemTextBlock => ({
-    type: "text",
-    text: text.toLowerCase()
-  }));
+  // 只对 Claude Code 类的系统提示词进行小写化，其他保持原样
+  const additionalBlocks = additional.map((text, index): SystemTextBlock => {
+    const block: SystemTextBlock = {
+      type: "text",
+      text: isCodeAssistantPrompt(text) ? text.toLowerCase() : text
+    };
+    // 如果启用缓存，在最后一个额外系统提示词块上添加 cache_control
+    if (enableCache && index === additional.length - 1) {
+      block.cache_control = { type: "ephemeral" };
+    }
+    return block;
+  });
+
+  // 如果没有额外的系统提示词但启用了缓存，在最后一个基础块上添加 cache_control
+  if (enableCache && additional.length === 0 && baseBlocks.length > 0) {
+    baseBlocks[baseBlocks.length - 1].cache_control = { type: "ephemeral" };
+  }
+
   return [...baseBlocks, ...additionalBlocks];
 }
 
@@ -2110,6 +2133,69 @@ async function pipeStreamToClient(factoryResp: Response, model: string): Promise
 
 
 
+/* ====== Claude 原生格式流式响应处理 ====== */
+
+async function pipeClaudeNativeStreamToClient(claudeResp: Response): Promise<Response> {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+
+  (async () => {
+    try {
+      const reader = claudeResp.body?.getReader();
+      if (!reader) {
+        await writer.close();
+        return;
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // 按完整的SSE事件分割（以双换行符为分隔）
+        const events = buffer.split(/\r?\n\r?\n/);
+        // 保留最后一个不完整的事件
+        buffer = events.pop() || "";
+
+        for (const event of events) {
+          if (event.trim()) {
+            // 写入完整的SSE事件，确保以双换行符结尾
+            await writer.write(encoder.encode(event + "\n\n"));
+          }
+        }
+      }
+
+      // 处理缓冲区中剩余的内容
+      if (buffer.trim()) {
+        await writer.write(encoder.encode(buffer + "\n\n"));
+      }
+
+    } catch (e) {
+      console.error("Claude原生流处理错误:", e);
+    } finally {
+      try {
+        await writer.close();
+      } catch {}
+    }
+  })();
+
+  return new Response(readable, {
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      "Connection": "keep-alive",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
+    },
+  });
+}
+
 /* ====== Claude 原生格式处理 ====== */
 
 async function handleClaudeNativeRequest(req: Request): Promise<Response> {
@@ -2180,11 +2266,11 @@ async function handleClaudeNativeRequest(req: Request): Promise<Response> {
         const lowerText = systemField.toLowerCase();
         if (!lowerText.startsWith("you are claude code, anthropic's official cli for") &&
             !lowerText.startsWith("you are an interactive cli tool that helps users")) {
-          systemBlocks = buildSystemBlocks([systemField]);
+          systemBlocks = buildSystemBlocks([systemField], true); // 启用缓存
         } else {
           // 被过滤的内容，只添加合规提示词
           console.log("过滤掉Claude Code系统提示词:", systemField.substring(0, 50) + "...");
-          systemBlocks = buildSystemBlocks([]);
+          systemBlocks = buildSystemBlocks([], true); // 启用缓存
         }
       } else if (Array.isArray(systemField)) {
         // 如果已经是块数组，提取文本并重建
@@ -2201,11 +2287,43 @@ async function handleClaudeNativeRequest(req: Request): Promise<Response> {
             }
             return true;
           });
-        systemBlocks = buildSystemBlocks(existingTexts);
+        systemBlocks = buildSystemBlocks(existingTexts, true); // 启用缓存
       }
     } else {
       // 如果没有系统提示词，只添加合规提示词
-      systemBlocks = buildSystemBlocks([]);
+      systemBlocks = buildSystemBlocks([], true); // 启用缓存
+    }
+
+    // SillyTavern 优化：在对话历史中添加缓存断点
+    // 策略：在倒数第2-3轮用户消息上设置缓存，这样大部分历史对话可以复用
+    const messages = claudeReq.messages ? [...claudeReq.messages] : [];
+    if (messages.length >= 4) {
+      // 找到倒数第2个用户消息的索引，在那里设置缓存断点
+      let userMsgCount = 0;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === "user") {
+          userMsgCount++;
+          if (userMsgCount === 2) {
+            // 在这个用户消息的最后一个content块上添加cache_control
+            const msg = messages[i];
+            if (Array.isArray(msg.content) && msg.content.length > 0) {
+              const lastBlock = msg.content[msg.content.length - 1] as any;
+              if (lastBlock && typeof lastBlock === "object") {
+                lastBlock.cache_control = { type: "ephemeral" };
+                console.log("SillyTavern优化: 在倒数第2个用户消息上设置缓存断点");
+              }
+            } else if (typeof msg.content === "string") {
+              // 如果是字符串，转换为块数组
+              messages[i] = {
+                ...msg,
+                content: [{ type: "text", text: msg.content, cache_control: { type: "ephemeral" } }] as any
+              };
+              console.log("SillyTavern优化: 在倒数第2个用户消息上设置缓存断点");
+            }
+            break;
+          }
+        }
+      }
     }
 
     // 处理thinking参数 - 修复budgetTokens为null或使用驼峰命名的问题
@@ -2230,7 +2348,7 @@ async function handleClaudeNativeRequest(req: Request): Promise<Response> {
     }
 
     // 构建最终的Claude请求，移除top_p和原始thinking参数（A社原生格式不支持top_p）
-    const { top_p, thinking: _rawThinking, ...restClaudeReq } = claudeReq as any;
+    const { top_p, thinking: _rawThinking, messages: _originalMessages, ...restClaudeReq } = claudeReq as any;
     if (top_p !== undefined) {
       console.log("移除top_p参数:", top_p);
     }
@@ -2238,6 +2356,7 @@ async function handleClaudeNativeRequest(req: Request): Promise<Response> {
     const finalClaudeReq = {
       ...restClaudeReq,
       system: systemBlocks,
+      messages, // 使用添加了缓存断点的messages
       ...(thinkingConfig ? { thinking: thinkingConfig } : {})
     };
 
@@ -2254,22 +2373,43 @@ async function handleClaudeNativeRequest(req: Request): Promise<Response> {
     });
     console.log("-".repeat(50));
 
+    // 检测是否是 Claude Opus 4.5 模型（支持 effort 参数）
+    const isOpus45 = finalClaudeReq.model.toLowerCase().includes("opus-4-5") ||
+                     finalClaudeReq.model.toLowerCase().includes("opus-4.5");
+
+    // 只有 Opus 4.5 才添加 effort 参数
+    let finalClaudeReqToSend = finalClaudeReq;
+    // 添加 prompt-caching-2024-07-31 支持提示词缓存
+    let anthropicBetaHeader = "interleaved-thinking-2025-05-14,context-1m-2025-08-07,prompt-caching-2024-07-31";
+
+    if (isOpus45) {
+      finalClaudeReqToSend = {
+        ...finalClaudeReq,
+        output_config: {
+          ...(finalClaudeReq as any).output_config,
+          effort: (finalClaudeReq as any).output_config?.effort ?? "high",
+        },
+      };
+      anthropicBetaHeader += ",effort-2025-11-24";
+      console.log("Opus 4.5 检测到，effort参数:", (finalClaudeReqToSend as any).output_config.effort);
+    }
+
     const claudeResp = await fetch("https://app.factory.ai/api/llm/a/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${apiKey}`,
-        "anthropic-beta": "interleaved-thinking-2025-05-14,context-1m-2025-08-07",
+        "anthropic-beta": anthropicBetaHeader,
         "anthropic-version": "2023-06-01",
       },
-      body: JSON.stringify(finalClaudeReq),
+      body: JSON.stringify(finalClaudeReqToSend),
     });
 
     if (!claudeResp.ok) {
       return await createErrorResponseFromUpstream(claudeResp, "Claude");
     }
 
-    // 直接返回Claude响应，添加CORS头（保持原有行为，不影响SillyTavern等已正常工作的客户端）
+    // 直接转发响应，fetchResponseToNodeResponse 会正确处理SSE缓冲
     const responseHeaders = new Headers(claudeResp.headers);
     responseHeaders.set("Access-Control-Allow-Origin", "*");
     responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -2875,18 +3015,55 @@ async function fetchResponseToNodeResponse(fetchResponse: Response, res: ServerR
     res.setHeader(key, value);
   });
 
+  const contentType = fetchResponse.headers.get('content-type') || '';
+  const isSSE = contentType.includes('text/event-stream');
+
   // Stream body
   if (fetchResponse.body) {
     const reader = fetchResponse.body.getReader();
 
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        res.write(value);
+    if (isSSE) {
+      // SSE流需要按事件边界缓冲，确保完整事件一起发送
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+
+          // 查找完整的SSE事件（以双换行符结尾）
+          let eventEnd: number;
+          while ((eventEnd = buffer.indexOf("\n\n")) !== -1) {
+            // 提取完整事件（包含结尾的\n\n）
+            const completeEvent = buffer.substring(0, eventEnd + 2);
+            buffer = buffer.substring(eventEnd + 2);
+
+            // 写入完整事件
+            res.write(completeEvent);
+          }
+        }
+
+        // 处理剩余缓冲区
+        if (buffer.length > 0) {
+          res.write(buffer);
+        }
+      } finally {
+        reader.releaseLock();
       }
-    } finally {
-      reader.releaseLock();
+    } else {
+      // 非SSE响应，直接转发
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
     }
   }
 
