@@ -924,16 +924,28 @@ function isGeminiModel(model: string): boolean {
   return model.toLowerCase().includes("gemini");
 }
 
-
+function isClaudeSearchModel(model: string): boolean {
+  if (typeof model !== "string") return false;
+  const lower = model.toLowerCase();
+  return lower.includes("claude") && lower.includes("-search");
+}
 
 function normalizeClaudeModel(model: string): string {
 
   if (typeof model !== "string") return "";
 
-  // ?? -thinking ??????????？
+  // 移除 -thinking 和 -search 后缀
+  return model.replace(/-thinking$/i, "").replace(/-search$/i, "");
 
-  return model.replace(/-thinking$/i, "");
+}
 
+// Claude web_search 工具定义
+interface ClaudeWebSearchTool {
+  type: "web_search_20250305";
+  name: "web_search";
+  max_uses?: number;
+  allowed_domains?: string[];
+  blocked_domains?: string[];
 }
 
 
@@ -1055,6 +1067,7 @@ function toClaudeRequest(openaiReq: OpenAIRequest): ClaudeRequest {
 
 
   const needsThinking = isClaudeThinkingModel(model);
+  const needsSearch = isClaudeSearchModel(model);
 
   const actualModel = normalizeClaudeModel(model);
 
@@ -1105,6 +1118,25 @@ function toClaudeRequest(openaiReq: OpenAIRequest): ClaudeRequest {
     top_p = undefined;
   }
 
+  // 构建工具列表
+  let tools: (ClaudeTool | ClaudeWebSearchTool)[] = [];
+
+  // 如果前端传入了 tools，转换格式
+  if (openaiReq.tools) {
+    tools = convertToolsToClaude(openaiReq.tools);
+  }
+
+  // 如果启用搜索，添加 web_search 工具
+  if (needsSearch) {
+    const webSearchTool: ClaudeWebSearchTool = {
+      type: "web_search_20250305",
+      name: "web_search",
+      max_uses: 5,
+    };
+    tools.push(webSearchTool);
+    console.log("已添加 web_search 工具");
+  }
+
   return {
 
     model: actualModel,
@@ -1123,8 +1155,8 @@ function toClaudeRequest(openaiReq: OpenAIRequest): ClaudeRequest {
 
     ...(thinking ? { thinking } : {}),
 
-    // 如果前端传入了 tools，转换格式并传递
-    ...(openaiReq.tools ? { tools: convertToolsToClaude(openaiReq.tools) } : {}),
+    // 工具列表（包括前端传入的和 web_search）
+    ...(tools.length > 0 ? { tools } : {}),
 
   };
 
@@ -2256,9 +2288,31 @@ async function handleClaudeNativeRequest(req: Request): Promise<Response> {
     // 解析Claude原生请求
     const claudeReq = await req.json() as ClaudeRequest;
 
-    // 处理系统提示词注入
+    // 调试：打印原始请求的 system 字段
+    console.log("=== 原始请求调试 ===");
+    console.log("原始 system 类型:", typeof claudeReq.system);
+    if (typeof claudeReq.system === "string") {
+      console.log("原始 system 长度:", claudeReq.system.length);
+      console.log("原始 system 前100字符:", claudeReq.system.substring(0, 100));
+    } else if (Array.isArray(claudeReq.system)) {
+      console.log("原始 system 块数:", claudeReq.system.length);
+      claudeReq.system.forEach((block: any, i: number) => {
+        console.log(`  block[${i}] type=${block.type}, 长度=${block.text?.length || 0}`);
+      });
+    } else {
+      console.log("原始 system 为空或未定义");
+    }
+    console.log("原始 messages 数量:", claudeReq.messages?.length || 0);
+
+    // 处理系统提示词注入 - 保留原有的 cache_control
     let systemField = claudeReq.system;
     let systemBlocks: SystemTextBlock[] = [];
+
+    // 合规提示词块（不加缓存，让缓存在用户内容上）
+    const complianceBlocks: SystemTextBlock[] = [
+      { type: "text", text: COMPLIANCE_SYSTEM_PROMPT },
+      { type: "text", text: BUFFER_SYSTEM_PROMPT },
+    ];
 
     if (systemField) {
       if (typeof systemField === "string") {
@@ -2266,61 +2320,125 @@ async function handleClaudeNativeRequest(req: Request): Promise<Response> {
         const lowerText = systemField.toLowerCase();
         if (!lowerText.startsWith("you are claude code, anthropic's official cli for") &&
             !lowerText.startsWith("you are an interactive cli tool that helps users")) {
-          systemBlocks = buildSystemBlocks([systemField], true); // 启用缓存
+          // 处理 Claude Code 类的系统提示词
+          const processedText = isCodeAssistantPrompt(systemField) ? systemField.toLowerCase() : systemField;
+          systemBlocks = [
+            ...complianceBlocks,
+            { type: "text", text: processedText, cache_control: { type: "ephemeral" } }
+          ];
         } else {
           // 被过滤的内容，只添加合规提示词
           console.log("过滤掉Claude Code系统提示词:", systemField.substring(0, 50) + "...");
-          systemBlocks = buildSystemBlocks([], true); // 启用缓存
+          complianceBlocks[complianceBlocks.length - 1].cache_control = { type: "ephemeral" };
+          systemBlocks = complianceBlocks;
         }
       } else if (Array.isArray(systemField)) {
-        // 如果已经是块数组，提取文本并重建
-        const existingTexts = systemField
-          .filter(block => block.type === "text")
-          .map(block => block.text)
-          // 过滤掉特定的Claude Code系统提示词
-          .filter(text => {
-            const lowerText = text.toLowerCase();
+        // 如果已经是块数组，保留原有结构和 cache_control
+        const filteredBlocks = systemField
+          .filter((block: any) => {
+            if (block.type !== "text") return true; // 保留非文本块
+            const lowerText = (block.text || "").toLowerCase();
             if (lowerText.startsWith("you are claude code, anthropic's official cli for") ||
                 lowerText.startsWith("you are an interactive cli tool that helps users")) {
-              console.log("过滤掉Claude Code系统提示词:", text.substring(0, 50) + "...");
+              console.log("过滤掉Claude Code系统提示词:", block.text.substring(0, 50) + "...");
               return false;
             }
             return true;
+          })
+          .map((block: any) => {
+            // 处理 Claude Code 类的系统提示词（小写化）
+            if (block.type === "text" && isCodeAssistantPrompt(block.text || "")) {
+              return { ...block, text: block.text.toLowerCase() };
+            }
+            return block;
           });
-        systemBlocks = buildSystemBlocks(existingTexts, true); // 启用缓存
+
+        // 检查是否有任何块带有 cache_control
+        const hasExistingCache = filteredBlocks.some((block: any) => block.cache_control);
+
+        if (filteredBlocks.length > 0) {
+          // 有用户系统提示词
+          if (!hasExistingCache) {
+            // 没有缓存断点，在最后一个块上添加
+            filteredBlocks[filteredBlocks.length - 1] = {
+              ...filteredBlocks[filteredBlocks.length - 1],
+              cache_control: { type: "ephemeral" }
+            };
+            console.log("反代添加缓存断点到系统提示词");
+          } else {
+            console.log("保留 SillyTavern 原有的缓存断点");
+          }
+          systemBlocks = [...complianceBlocks, ...filteredBlocks];
+        } else {
+          // 用户系统提示词为空（如 SillyTavern 发送空数组），在合规提示词上加缓存
+          complianceBlocks[complianceBlocks.length - 1].cache_control = { type: "ephemeral" };
+          systemBlocks = complianceBlocks;
+          console.log("系统提示词为空，在合规提示词上添加缓存断点");
+        }
       }
     } else {
-      // 如果没有系统提示词，只添加合规提示词
-      systemBlocks = buildSystemBlocks([], true); // 启用缓存
+      // 如果没有系统提示词，只添加合规提示词并在最后一个上加缓存
+      complianceBlocks[complianceBlocks.length - 1].cache_control = { type: "ephemeral" };
+      systemBlocks = complianceBlocks;
     }
 
     // SillyTavern 优化：在对话历史中添加缓存断点
-    // 策略：在倒数第2-3轮用户消息上设置缓存，这样大部分历史对话可以复用
     const messages = claudeReq.messages ? [...claudeReq.messages] : [];
-    if (messages.length >= 4) {
-      // 找到倒数第2个用户消息的索引，在那里设置缓存断点
-      let userMsgCount = 0;
-      for (let i = messages.length - 1; i >= 0; i--) {
-        if (messages[i].role === "user") {
-          userMsgCount++;
-          if (userMsgCount === 2) {
-            // 在这个用户消息的最后一个content块上添加cache_control
-            const msg = messages[i];
-            if (Array.isArray(msg.content) && msg.content.length > 0) {
-              const lastBlock = msg.content[msg.content.length - 1] as any;
-              if (lastBlock && typeof lastBlock === "object") {
-                lastBlock.cache_control = { type: "ephemeral" };
-                console.log("SillyTavern优化: 在倒数第2个用户消息上设置缓存断点");
+
+    // 检查消息中是否已有缓存断点（SillyTavern 可能已添加）
+    const hasExistingMsgCache = messages.some((msg: any) => {
+      if (Array.isArray(msg.content)) {
+        return msg.content.some((block: any) => block.cache_control);
+      }
+      return false;
+    });
+
+    if (hasExistingMsgCache) {
+      console.log("保留 SillyTavern 原有的消息缓存断点");
+    } else {
+      // SillyTavern 特殊处理：所有内容合并在一条消息里
+      // 在第一条 user 消息上添加缓存断点（角色卡/设定部分）
+      if (messages.length === 1 && messages[0].role === "user") {
+        const msg = messages[0];
+        if (Array.isArray(msg.content) && msg.content.length > 0) {
+          // 在第一个 content block 上添加缓存（通常是角色卡）
+          const firstBlock = msg.content[0] as any;
+          if (firstBlock && typeof firstBlock === "object") {
+            firstBlock.cache_control = { type: "ephemeral" };
+            console.log("反代添加: 在唯一消息的第一个块上设置缓存断点");
+          }
+        } else if (typeof msg.content === "string") {
+          // 字符串内容，转换为块数组并添加缓存
+          messages[0] = {
+            ...msg,
+            content: [{ type: "text", text: msg.content, cache_control: { type: "ephemeral" } }] as any
+          };
+          console.log("反代添加: 在唯一消息上设置缓存断点（字符串转块）");
+        }
+      }
+      // 多条消息时：在倒数第2个用户消息上设置缓存
+      else if (messages.length >= 4) {
+        let userMsgCount = 0;
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].role === "user") {
+            userMsgCount++;
+            if (userMsgCount === 2) {
+              const msg = messages[i];
+              if (Array.isArray(msg.content) && msg.content.length > 0) {
+                const lastBlock = msg.content[msg.content.length - 1] as any;
+                if (lastBlock && typeof lastBlock === "object") {
+                  lastBlock.cache_control = { type: "ephemeral" };
+                  console.log("反代添加: 在倒数第2个用户消息上设置缓存断点");
+                }
+              } else if (typeof msg.content === "string") {
+                messages[i] = {
+                  ...msg,
+                  content: [{ type: "text", text: msg.content, cache_control: { type: "ephemeral" } }] as any
+                };
+                console.log("反代添加: 在倒数第2个用户消息上设置缓存断点");
               }
-            } else if (typeof msg.content === "string") {
-              // 如果是字符串，转换为块数组
-              messages[i] = {
-                ...msg,
-                content: [{ type: "text", text: msg.content, cache_control: { type: "ephemeral" } }] as any
-              };
-              console.log("SillyTavern优化: 在倒数第2个用户消息上设置缓存断点");
+              break;
             }
-            break;
           }
         }
       }
@@ -2369,8 +2487,22 @@ async function handleClaudeNativeRequest(req: Request): Promise<Response> {
     console.log("系统提示词数量:", systemBlocks.length);
     console.log("系统提示词内容:");
     systemBlocks.forEach((block, index) => {
-      console.log(`  [${index}]: ${block.text.substring(0, 50)}...`);
+      const hasCache = block.cache_control ? " [CACHED]" : "";
+      console.log(`  [${index}]${hasCache}: ${block.text.substring(0, 50)}...`);
     });
+    // 检查消息中的缓存断点
+    let msgCacheCount = 0;
+    messages.forEach((msg: any, idx: number) => {
+      if (Array.isArray(msg.content)) {
+        msg.content.forEach((block: any) => {
+          if (block.cache_control) {
+            msgCacheCount++;
+            console.log(`  消息[${idx}] ${msg.role} 有缓存断点`);
+          }
+        });
+      }
+    });
+    console.log("消息缓存断点数:", msgCacheCount);
     console.log("-".repeat(50));
 
     // 检测是否是 Claude Opus 4.5 模型（支持 effort 参数）
@@ -2422,6 +2554,96 @@ async function handleClaudeNativeRequest(req: Request): Promise<Response> {
 
   } catch (error: any) {
     console.error("处理Claude原生请求时发生错误:", error);
+    return createErrorResponse(
+      `Internal Server Error: ${error?.message || String(error)}`,
+      500,
+      "internal_error"
+    );
+  }
+}
+
+/* ====== Token 计数端点处理 ====== */
+
+async function handleTokenCountRequest(req: Request): Promise<Response> {
+  try {
+    const authHeaderRaw = req.headers.get("Authorization");
+    const authToken = extractAuthToken(authHeaderRaw);
+    const xApiKey = req.headers.get("x-api-key");
+    const proxyHeaderToken = (req.headers.get(PROXY_KEY_HEADER) ?? "").trim();
+
+    let matchedProxyKey: string | null = null;
+    if (proxyHeaderToken) {
+      if (PROXY_ACCESS_KEY_SET.has(proxyHeaderToken)) {
+        matchedProxyKey = proxyHeaderToken;
+      } else {
+        return createErrorResponse("Missing or invalid proxy access key", 401, "invalid_proxy_key", "proxy_key");
+      }
+    }
+
+    if (!matchedProxyKey && authToken && PROXY_ACCESS_KEY_SET.has(authToken)) {
+      matchedProxyKey = authToken;
+    }
+
+    if (PROXY_ACCESS_KEY_SET.size > 0 && !matchedProxyKey && !authToken && !xApiKey) {
+      return createErrorResponse("Missing or invalid proxy access key", 401, "invalid_proxy_key", "proxy_key");
+    }
+
+    const authTokenIsProxyKey = Boolean(matchedProxyKey) && authToken === matchedProxyKey;
+
+    let apiKey = "";
+    if (xApiKey) {
+      apiKey = xApiKey;
+    } else if (!authTokenIsProxyKey && authToken) {
+      apiKey = authToken;
+    }
+
+    if (!apiKey) {
+      apiKey = getNextFactoryApiKey() ?? "";
+      if (apiKey) {
+        console.log("使用轮询Factory密钥:", maskKeyForLog(apiKey));
+      }
+    }
+
+    if (!apiKey) {
+      return createErrorResponse("Missing or invalid API key", 401, "invalid_request_error", "invalid_api_key");
+    }
+
+    // 解析请求体并直接转发
+    const requestBody = await req.json();
+
+    console.log("=== Token 计数请求 ===");
+    console.log("模型:", requestBody.model);
+    console.log("消息数:", requestBody.messages?.length || 0);
+
+    const countResp = await fetch("https://app.factory.ai/api/llm/a/v1/messages/count_tokens", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!countResp.ok) {
+      return await createErrorResponseFromUpstream(countResp, "Claude");
+    }
+
+    const result = await countResp.json();
+    console.log("Token 计数结果:", result);
+
+    return new Response(JSON.stringify(result), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
+      },
+    });
+
+  } catch (error: any) {
+    console.error("处理Token计数请求时发生错误:", error);
     return createErrorResponse(
       `Internal Server Error: ${error?.message || String(error)}`,
       500,
@@ -2773,18 +2995,20 @@ async function handleOpenAIRequest(req: Request): Promise<Response> {
     if (isClaude) {
       // 标准模式：进行格式转换
       const claudeReq = toClaudeRequest(openaiReq);
+      const hasSearch = isClaudeSearchModel(openaiReq.model);
 
       console.log("正在发送Claude API请求...");
       console.log("URL: https://app.factory.ai/api/llm/a/v1/messages");
       console.log("原始模型:", openaiReq.model);
       console.log("实际模型:", claudeReq.model);
       console.log("思考模式:", hasThinking ? "已启用 (16k tokens)" : "未启用");
+      console.log("搜索模式:", hasSearch ? "已启用 (web_search)" : "未启用");
       console.log("流式:", claudeReq.stream);
       console.log("最大tokens:", claudeReq.max_tokens);
       console.log("对话轮数:", claudeReq.messages.length);
       if (claudeReq.tools && claudeReq.tools.length > 0) {
         console.log("工具数量:", claudeReq.tools.length);
-        console.log("工具列表:", claudeReq.tools.map(t => t.name).join(", "));
+        console.log("工具列表:", claudeReq.tools.map((t: any) => t.name).join(", "));
       }
       if (hasThinking) {
         console.log("Thinking配置:", JSON.stringify(claudeReq.thinking));
@@ -2968,8 +3192,11 @@ async function handleRequest(req: Request): Promise<Response> {
 
   const url = new URL(req.url);
 
-  // 路由到不同的处理函数
-  if (url.pathname.includes("/v1/messages")) {
+  // 路由到不同的处理函数（注意：更具体的路径放前面）
+  if (url.pathname.includes("/v1/messages/count_tokens")) {
+    // Token 计数端点
+    return handleTokenCountRequest(req);
+  } else if (url.pathname.includes("/v1/messages")) {
     // Claude 原生格式端点
     return handleClaudeNativeRequest(req);
   } else if (url.pathname.includes("/v1/chat/completions")) {
@@ -3111,6 +3338,7 @@ server.listen(PORT, () => {
   console.log(`\n支持的端点:`);
   console.log(`  - OpenAI格式: http://localhost:${PORT}/v1/chat/completions`);
   console.log(`  - Claude原生格式: http://localhost:${PORT}/v1/messages`);
+  console.log(`  - Token计数: http://localhost:${PORT}/v1/messages/count_tokens`);
   console.log(`\n支持模型:`);
   console.log(`  - Factory AI 模型 (通过OpenAI端点)`);
   console.log(`  - Claude 系列模型 (两个端点都支持)`);
@@ -3118,7 +3346,10 @@ server.listen(PORT, () => {
   console.log(`  - Vertex 模型 (模型名包含 'vertex' 前缀)`);
   console.log(`\nClaude特性:`);
   console.log(`  - 思考模式: 模型名包含 '-thinking' 后缀自动启用`);
-  console.log(`    示例: claude-3-5-sonnet-20241022-thinking`);
+  console.log(`  - 搜索模式: 模型名包含 '-search' 后缀启用 web_search 工具`);
+  console.log(`  - Opus 4.5: 自动启用 effort=high 和扩展思考`);
+  console.log(`  - 提示词缓存: 自动添加缓存断点，兼容 SillyTavern 配置`);
+  console.log(`    示例: claude-sonnet-4-5-thinking, claude-opus-4-5-search`);
   console.log(`  - Bedrock示例: bedrock-claude-3-5-sonnet-20241022`);
   console.log(`  - Vertex示例: vertex-claude-3-5-sonnet-20241022`);
   console.log(`\n注意: 所有请求都会自动注入合规系统提示词`);
